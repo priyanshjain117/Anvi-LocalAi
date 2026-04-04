@@ -1,0 +1,27 @@
+name: anvi
+description: On-device LLM chat app using llama.cpp
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # llama.cpp Flutter binding — runs GGUF models locally via C FFI
+  flutter_llama_cpp: ^0.2.0
+
+  # HTTP download with progress
+  dio: ^5.4.0
+
+  # App documents directory for storing model files
+  path_provider: ^2.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
