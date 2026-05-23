@@ -1,5 +1,15 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../core/theme/anvi_colors.dart';
+import '../core/theme/anvi_spacing.dart';
+import '../core/utils/download_progress.dart';
+import '../core/utils/formatters.dart';
+import '../core/widgets/ambient_background.dart';
+import '../core/widgets/anvi_logo.dart';
+import '../core/widgets/glass_panel.dart';
+import '../core/widgets/pressable_scale.dart';
 import '../models/llm_model.dart';
 import '../services/model_manager.dart';
 import 'chat_screen.dart';
@@ -15,6 +25,7 @@ class _ModelPickerScreenState extends State<ModelPickerScreen> {
   final _manager = ModelManager();
   final Map<String, bool> _downloaded = {};
   final Map<String, double> _progress = {};
+  final Map<String, DownloadProgress> _details = {};
   final Map<String, CancelToken> _cancelTokens = {};
   String? _downloading;
   String? _loading;
@@ -26,54 +37,58 @@ class _ModelPickerScreenState extends State<ModelPickerScreen> {
   }
 
   Future<void> _checkDownloaded() async {
-    for (final m in availableModels) {
-      _downloaded[m.fileName] = await _manager.isDownloaded(m);
+    for (final model in availableModels) {
+      _downloaded[model.fileName] = await _manager.isDownloaded(model);
     }
     if (mounted) setState(() {});
   }
 
   Future<void> _handleModel(LLMModel model) async {
+    HapticFeedback.selectionClick();
     final isReady = _downloaded[model.fileName] ?? false;
 
     if (!isReady) {
-      // ── Download ──
       final token = CancelToken();
       _cancelTokens[model.fileName] = token;
       setState(() {
         _downloading = model.fileName;
         _progress[model.fileName] = 0;
+        _details.remove(model.fileName);
       });
 
       try {
         await _manager.download(
           model,
-          onProgress: (p) => setState(() => _progress[model.fileName] = p),
+          onProgress: (value) =>
+              setState(() => _progress[model.fileName] = value),
+          onDetailedProgress: (value) =>
+              setState(() => _details[model.fileName] = value),
           cancelToken: token,
         );
         setState(() {
           _downloaded[model.fileName] = true;
           _downloading = null;
         });
-      } catch (e) {
+      } catch (error) {
         setState(() => _downloading = null);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Download failed: $e')),
-          );
-        }
+        if (!mounted) return;
+        final message = error is DioException && CancelToken.isCancel(error)
+            ? 'Download cancelled'
+            : 'Download failed: $error';
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(message)));
         return;
       }
     }
 
-    // ── Load into memory ──
     setState(() => _loading = model.fileName);
     try {
       await _manager.loadModel(model);
-    } catch (e) {
+    } catch (error) {
       setState(() => _loading = null);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to load model: $e')),
+          SnackBar(content: Text('Failed to load model: $error')),
         );
       }
       return;
@@ -81,73 +96,71 @@ class _ModelPickerScreenState extends State<ModelPickerScreen> {
     setState(() => _loading = null);
 
     if (mounted) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => ChatScreen(model: model)),
+      Navigator.of(context).pushReplacement(
+        PageRouteBuilder<void>(
+          pageBuilder: (_, animation, __) => FadeTransition(
+            opacity: animation,
+            child: ChatScreen(model: model),
+          ),
+        ),
       );
     }
   }
 
+  void _cancelDownload(LLMModel model) {
+    _cancelTokens[model.fileName]?.cancel('User cancelled');
+    _cancelTokens.remove(model.fileName);
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(height: 24),
-              // Header
-              Row(
-                children: [
-                  Container(
-                    width: 42,
-                    height: 42,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF00E5FF).withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Icon(Icons.memory_rounded,
-                        color: Color(0xFF00E5FF), size: 22),
-                  ),
-                  const SizedBox(width: 14),
-                  const Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Local AI',
-                          style: TextStyle(
-                              fontSize: 22, fontWeight: FontWeight.w700)),
-                      Text('100% on-device • No internet needed',
-                          style:
-                              TextStyle(fontSize: 12, color: Colors.white38)),
-                    ],
-                  ),
-                ],
-              ),
-              const SizedBox(height: 40),
-              const Text('Choose a model',
-                  style: TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w500,
-                      color: Colors.white54,
-                      letterSpacing: 1.2)),
-              const SizedBox(height: 16),
+    final width = MediaQuery.sizeOf(context).width;
+    final tablet = width >= 760;
 
-              // Model cards
-              Expanded(
-                child: ListView.separated(
+    return Scaffold(
+      body: AmbientBackground(
+        child: SafeArea(
+          child: CustomScrollView(
+            slivers: [
+              SliverPadding(
+                padding: EdgeInsets.fromLTRB(
+                  tablet ? 40 : 22,
+                  22,
+                  tablet ? 40 : 22,
+                  0,
+                ),
+                sliver: SliverToBoxAdapter(child: _Header(tablet: tablet)),
+              ),
+              SliverPadding(
+                padding: EdgeInsets.fromLTRB(
+                  tablet ? 40 : 22,
+                  28,
+                  tablet ? 40 : 22,
+                  120,
+                ),
+                sliver: SliverGrid.builder(
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: width >= 1100
+                        ? 3
+                        : width >= 720
+                            ? 2
+                            : 1,
+                    mainAxisSpacing: 16,
+                    crossAxisSpacing: 16,
+                    mainAxisExtent: tablet ? 250 : 236,
+                  ),
                   itemCount: availableModels.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 12),
-                  itemBuilder: (context, i) {
-                    final model = availableModels[i];
+                  itemBuilder: (context, index) {
+                    final model = availableModels[index];
                     return _ModelCard(
                       model: model,
                       isDownloaded: _downloaded[model.fileName] ?? false,
                       isDownloading: _downloading == model.fileName,
                       isLoading: _loading == model.fileName,
                       progress: _progress[model.fileName] ?? 0,
+                      details: _details[model.fileName],
                       onTap: () => _handleModel(model),
+                      onCancel: () => _cancelDownload(model),
                     );
                   },
                 ),
@@ -160,7 +173,132 @@ class _ModelPickerScreenState extends State<ModelPickerScreen> {
   }
 }
 
-// ── Model Card Widget ──────────────────────────────────────────────────────
+class _Header extends StatelessWidget {
+  final bool tablet;
+
+  const _Header({required this.tablet});
+
+  @override
+  Widget build(BuildContext context) {
+    final intro = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Row(
+          children: [
+            AnviLogo(size: 48),
+            SizedBox(width: 14),
+            Text(
+              'Anvi',
+              style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800),
+            ),
+          ],
+        ),
+        const SizedBox(height: 22),
+        Text(
+          'Local AI model marketplace',
+          style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                fontWeight: FontWeight.w800,
+                height: 1.05,
+              ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          'Download once. Load into memory. Chat privately with llama.cpp running fully offline on this device.',
+          style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                color: Colors.white60,
+                height: 1.45,
+              ),
+        ),
+      ],
+    );
+
+    if (!tablet) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          intro,
+          const SizedBox(height: 22),
+          const _CapabilityPanel(),
+        ],
+      );
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(flex: 3, child: intro),
+        const SizedBox(width: 28),
+        const Expanded(flex: 2, child: _CapabilityPanel()),
+      ],
+    );
+  }
+}
+
+class _CapabilityPanel extends StatelessWidget {
+  const _CapabilityPanel();
+
+  @override
+  Widget build(BuildContext context) {
+    final downloaded = availableModels.length;
+    return GlassPanel(
+      glow: true,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Device AI Capsule',
+            style: TextStyle(fontSize: 13, color: AnviColors.champagne),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              _Metric(label: 'Runtime', value: 'llama.cpp'),
+              const SizedBox(width: 12),
+              _Metric(label: 'Privacy', value: 'Offline'),
+              const SizedBox(width: 12),
+              _Metric(label: 'Models', value: '$downloaded'),
+            ],
+          ),
+          const SizedBox(height: 14),
+          const Text(
+            'Recommended: start with TinyLlama on phones, then move up when you have enough RAM and patience for richer responses.',
+            style: TextStyle(color: Colors.white54, height: 1.35),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Metric extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _Metric({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.28),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label,
+                style: const TextStyle(fontSize: 11, color: Colors.white38)),
+            const SizedBox(height: 4),
+            Text(value, style: const TextStyle(fontWeight: FontWeight.w700)),
+          ],
+        ),
+      ),
+    );
+  }
+}
 
 class _ModelCard extends StatelessWidget {
   final LLMModel model;
@@ -168,7 +306,9 @@ class _ModelCard extends StatelessWidget {
   final bool isDownloading;
   final bool isLoading;
   final double progress;
+  final DownloadProgress? details;
   final VoidCallback onTap;
+  final VoidCallback onCancel;
 
   const _ModelCard({
     required this.model,
@@ -176,80 +316,100 @@ class _ModelCard extends StatelessWidget {
     required this.isDownloading,
     required this.isLoading,
     required this.progress,
+    required this.details,
     required this.onTap,
+    required this.onCancel,
   });
 
   @override
   Widget build(BuildContext context) {
-    final accent = const Color(0xFF00E5FF);
     final busy = isDownloading || isLoading;
-
-    return GestureDetector(
+    return PressableScale(
       onTap: busy ? null : onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        decoration: BoxDecoration(
-          color: const Color(0xFF161B22),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: isDownloaded
-                ? accent.withOpacity(0.4)
-                : Colors.white.withOpacity(0.07),
-          ),
-        ),
+      child: GlassPanel(
+        glow: isDownloaded || model.recommended,
         padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
+                _ModelGlyph(model: model),
+                const SizedBox(width: 12),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(model.name,
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.w600)),
+                      Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              model.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                          if (model.recommended) ...[
+                            const SizedBox(width: 8),
+                            const _Badge(label: 'Recommended'),
+                          ],
+                        ],
+                      ),
                       const SizedBox(height: 4),
-                      Text(model.description,
-                          style: const TextStyle(
-                              fontSize: 13, color: Colors.white54)),
+                      Text(
+                        model.performanceLabel,
+                        style: const TextStyle(
+                            color: AnviColors.champagne, fontSize: 12),
+                      ),
                     ],
                   ),
                 ),
-                const SizedBox(width: 12),
-                _StatusChip(
+                _Status(
                   isDownloaded: isDownloaded,
                   isDownloading: isDownloading,
                   isLoading: isLoading,
-                  sizeLabel: model.sizeLabel,
+                  progress: progress,
                 ),
               ],
             ),
-
-            // Progress bar during download
+            const SizedBox(height: AnviSpacing.lg),
+            Text(
+              model.description,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white60, height: 1.35),
+            ),
+            const Spacer(),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _InfoPill(
+                    icon: Icons.storage_rounded,
+                    label: Formatters.bytes(model.sizeBytes)),
+                _InfoPill(icon: Icons.memory_rounded, label: model.ramLabel),
+                const _InfoPill(icon: Icons.lock_rounded, label: 'Offline'),
+              ],
+            ),
             if (isDownloading) ...[
               const SizedBox(height: 14),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(4),
-                child: LinearProgressIndicator(
-                  value: progress,
-                  minHeight: 4,
-                  backgroundColor: Colors.white12,
-                  valueColor: AlwaysStoppedAnimation(accent),
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text('${(progress * 100).toStringAsFixed(1)}%',
-                  style: TextStyle(fontSize: 11, color: accent)),
+              _DownloadBar(
+                  progress: progress, details: details, onCancel: onCancel),
             ],
-
             if (isLoading) ...[
               const SizedBox(height: 14),
-              const LinearProgressIndicator(minHeight: 3),
-              const SizedBox(height: 6),
-              const Text('Loading model into memory…',
-                  style: TextStyle(fontSize: 11, color: Colors.white38)),
+              const LinearProgressIndicator(
+                minHeight: 3,
+                color: AnviColors.moltenGold,
+                backgroundColor: Colors.white12,
+              ),
+              const SizedBox(height: 8),
+              const Text('Loading GGUF weights into memory...',
+                  style: TextStyle(fontSize: 12, color: Colors.white38)),
             ],
           ],
         ),
@@ -258,51 +418,175 @@ class _ModelCard extends StatelessWidget {
   }
 }
 
-class _StatusChip extends StatelessWidget {
+class _ModelGlyph extends StatelessWidget {
+  final LLMModel model;
+
+  const _ModelGlyph({required this.model});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 48,
+      height: 48,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(18),
+        gradient: const LinearGradient(
+          colors: [AnviColors.crimson, AnviColors.ember, AnviColors.champagne],
+        ),
+        boxShadow: [
+          BoxShadow(
+              color: AnviColors.ember.withValues(alpha: 0.3), blurRadius: 18),
+        ],
+      ),
+      child: Center(
+        child: Text(
+          model.name.characters.first,
+          style: const TextStyle(
+            color: AnviColors.voidBlack,
+            fontWeight: FontWeight.w900,
+            fontSize: 20,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Status extends StatelessWidget {
   final bool isDownloaded;
   final bool isDownloading;
   final bool isLoading;
-  final String sizeLabel;
+  final double progress;
 
-  const _StatusChip({
+  const _Status({
     required this.isDownloaded,
     required this.isDownloading,
     required this.isLoading,
-    required this.sizeLabel,
+    required this.progress,
   });
 
   @override
   Widget build(BuildContext context) {
     if (isLoading) {
       return const SizedBox(
-          width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2));
-    }
-    if (isDownloading) {
-      return const Icon(Icons.downloading_rounded,
-          color: Color(0xFF00E5FF), size: 22);
-    }
-    if (isDownloaded) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(
-          color: const Color(0xFF00E5FF).withOpacity(0.12),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: const Text('Ready',
-            style: TextStyle(
-                color: Color(0xFF00E5FF),
-                fontSize: 12,
-                fontWeight: FontWeight.w600)),
+        width: 28,
+        height: 28,
+        child: CircularProgressIndicator(strokeWidth: 2.5),
       );
     }
+    if (isDownloading) {
+      return SizedBox(
+        width: 36,
+        height: 36,
+        child: CircularProgressIndicator(
+          value: progress,
+          strokeWidth: 3,
+          color: AnviColors.moltenGold,
+          backgroundColor: Colors.white12,
+        ),
+      );
+    }
+    if (isDownloaded) return const _Badge(label: 'Ready');
+    return const Icon(Icons.download_rounded, color: AnviColors.champagne);
+  }
+}
+
+class _Badge extends StatelessWidget {
+  final String label;
+
+  const _Badge({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
       decoration: BoxDecoration(
-        color: Colors.white10,
-        borderRadius: BorderRadius.circular(20),
+        color: AnviColors.champagne.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: AnviColors.champagne.withValues(alpha: 0.3)),
       ),
-      child: Text(sizeLabel,
-          style: const TextStyle(color: Colors.white54, fontSize: 12)),
+      child: Text(
+        label,
+        style: const TextStyle(
+          color: AnviColors.champagne,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+class _InfoPill extends StatelessWidget {
+  final IconData icon;
+  final String label;
+
+  const _InfoPill({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.065),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: AnviColors.champagne),
+          const SizedBox(width: 6),
+          Text(label,
+              style: const TextStyle(fontSize: 12, color: Colors.white70)),
+        ],
+      ),
+    );
+  }
+}
+
+class _DownloadBar extends StatelessWidget {
+  final double progress;
+  final DownloadProgress? details;
+  final VoidCallback onCancel;
+
+  const _DownloadBar({
+    required this.progress,
+    required this.details,
+    required this.onCancel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(999),
+          child: LinearProgressIndicator(
+            value: progress,
+            minHeight: 7,
+            color: AnviColors.moltenGold,
+            backgroundColor: Colors.white12,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                '${details?.percentLabel ?? '0.0%'}  ${details?.speedLabel ?? '--'}  ETA ${details?.etaLabel ?? '--'}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11, color: Colors.white38),
+              ),
+            ),
+            TextButton(
+              onPressed: onCancel,
+              child: const Text('Cancel'),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

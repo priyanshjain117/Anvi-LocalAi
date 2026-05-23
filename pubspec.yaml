@@ -21,6 +21,10 @@ dependencies:
 
   path_provider: any
 
+  flutter_markdown: ^0.7.7+1
+
+  google_fonts: ^6.3.3
+
 dev_dependencies:
 
   flutter_test:
@@ -32,4 +36,3 @@ dev_dependencies:
 flutter:
 
   uses-material-design: true
-

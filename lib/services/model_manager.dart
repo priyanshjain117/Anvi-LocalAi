@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:fllama/fllama.dart';
 import 'package:path_provider/path_provider.dart';
+import '../core/utils/download_progress.dart';
 import '../models/llm_model.dart';
 
 class ModelManager {
@@ -11,6 +12,11 @@ class ModelManager {
   ModelManager._internal();
 
   String? _contextId;
+  LLMModel? _loadedModel;
+
+  String? get contextId => _contextId;
+  LLMModel? get loadedModel => _loadedModel;
+  bool get hasLoadedModel => _contextId != null;
 
   // ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -29,15 +35,35 @@ class ModelManager {
   Future<void> download(
     LLMModel model, {
     required void Function(double progress) onProgress,
+    void Function(DownloadProgress progress)? onDetailedProgress,
     CancelToken? cancelToken,
   }) async {
     final path = await modelPath(model);
+    final stopwatch = Stopwatch()..start();
     await Dio().download(
       model.downloadUrl,
       path,
       cancelToken: cancelToken,
       onReceiveProgress: (received, total) {
-        if (total > 0) onProgress(received / total);
+        if (total <= 0) return;
+        final progress = received / total;
+        onProgress(progress);
+
+        final elapsed = stopwatch.elapsedMilliseconds / 1000;
+        final bytesPerSecond = elapsed <= 0 ? 0.0 : received / elapsed;
+        final remaining = total - received;
+        final eta = bytesPerSecond <= 0
+            ? null
+            : Duration(seconds: (remaining / bytesPerSecond).round());
+        onDetailedProgress?.call(
+          DownloadProgress(
+            received: received,
+            total: total,
+            progress: progress,
+            bytesPerSecond: bytesPerSecond,
+            eta: eta,
+          ),
+        );
       },
     );
   }
@@ -48,20 +74,21 @@ class ModelManager {
     if (_contextId != null) {
       await Fllama.instance()?.releaseContext(double.parse(_contextId!));
       _contextId = null;
+      _loadedModel = null;
     }
 
     final path = await modelPath(model);
 
-    final result = await Fllama.instance()
-        ?.initContext(path, 
-        nCtx: 2048,      // Context window size
-  nGpuLayers: 33,
+    final result = await Fllama.instance()?.initContext(path,
+        nCtx: 2048, // Context window size
+        nGpuLayers: 33,
         emitLoadProgress: true);
 
     if (result == null || result['contextId'] == null) {
       throw Exception('fllama: initContext failed — model may be corrupt.');
     }
     _contextId = result['contextId'].toString();
+    _loadedModel = model;
   }
 
   // ── Inference (streaming) ──────────────────────────────────────────────────
@@ -71,7 +98,7 @@ class ModelManager {
   // data["result"]["token"] holding the new token string.
   // End of generation fires function=="completionEnd".
 
-Stream<String> chat(String userMessage) async* {
+  Stream<String> chat(String userMessage) async* {
     if (_contextId == null) {
       throw StateError('No model loaded — call loadModel() first.');
     }
@@ -86,13 +113,12 @@ Stream<String> chat(String userMessage) async* {
     final controller = StreamController<String>();
 
     final sub = Fllama.instance()?.onTokenStream?.listen((data) {
-      print('🔥 fllama event: $data'); 
       final fn = data['function'];
-      
+
       if (fn == 'completion') {
         // Safely extract the token depending on how fllama wraps the map
-        final token = (data['result'] != null && data['result'] is Map) 
-            ? (data['result']['token'] ?? '').toString() 
+        final token = (data['result'] != null && data['result'] is Map)
+            ? (data['result']['token'] ?? '').toString()
             : (data['token'] ?? '').toString();
 
         if (token.isNotEmpty && !controller.isClosed) {
@@ -104,7 +130,8 @@ Stream<String> chat(String userMessage) async* {
     });
 
     // DO NOT 'await' this! Let it run in the background so the stream can yield below.
-    Fllama.instance()?.completion(
+    Fllama.instance()
+        ?.completion(
       double.parse(_contextId!),
       prompt: prompt,
       nPredict: 512,
@@ -113,7 +140,8 @@ Stream<String> chat(String userMessage) async* {
       penaltyRepeat: 1.1,
       stop: ['<|user|>', '<|system|>', '</s>'],
       emitRealtimeCompletion: true, // <--- This wakes up the stream!
-    ).then((_) {
+    )
+        .then((_) {
       // Fallback: Ensure the stream closes when the Future completes
       if (!controller.isClosed) controller.close();
     }).catchError((e) {
@@ -122,65 +150,22 @@ Stream<String> chat(String userMessage) async* {
 
     // Immediately yield the stream so the UI can listen while the model thinks
     yield* controller.stream;
-    
+
     // Clean up the listener when the stream is fully closed
     await sub?.cancel();
   }
-
-  // Stream<String> chat(String userMessage) async* {
-  //   if (_contextId == null) {
-  //     throw StateError('No model loaded — call loadModel() first.');
-  //   }
-
-  //   final prompt =
-  //       '<|system|>\nYou are a helpful AI assistant running fully on-device. '
-  //       'Be concise.\n'
-  //       '<|user|>\n$userMessage\n'
-  //       '<|assistant|>\n';
-
-  //   final controller = StreamController<String>();
-
-  //   // Listen BEFORE calling completion so we don't miss early tokens.
-  //   final sub = Fllama.instance()?.onTokenStream?.listen((data) {
-  //      print('🔥 fllama event: $data'); 
-  //     final fn = data['function'];
-  //     if (fn == 'completion') {
-  //       final token = (data['result']?['token'] ?? '').toString();
-  //       if (token.isNotEmpty && !controller.isClosed) {
-  //         controller.add(token);
-  //       }
-  //     } else if (fn == 'completionEnd') {
-  //       if (!controller.isClosed) controller.close();
-  //     }
-  //   });
-
-  //   // Pass all params as a plain Map — this is how fllama's platform channel
-  //   // accepts them. Named Dart params like repeatPenalty do NOT exist.
-  //   await Fllama.instance()?.completion(
-  //     double.parse(_contextId!),
-  //       prompt: prompt,
-  //       nPredict: 512,
-  //       temperature: 0.7,
-  //       topP: 0.9,
-  //       penaltyRepeat: 1.1,
-  //       stop: ['<|user|>', '<|system|>', '</s>'],
-  //   );
-
-  //   yield* controller.stream;
-  //   await sub?.cancel();
-  // }
 
   // ── Stop / cleanup ─────────────────────────────────────────────────────────
 
   void stopGeneration() {
     if (_contextId != null) {
-      Fllama.instance()
-          ?.stopCompletion(contextId: double.parse(_contextId!));
+      Fllama.instance()?.stopCompletion(contextId: double.parse(_contextId!));
     }
   }
 
   void dispose() {
     Fllama.instance()?.releaseAllContexts();
     _contextId = null;
+    _loadedModel = null;
   }
 }

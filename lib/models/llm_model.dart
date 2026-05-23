@@ -53,6 +53,9 @@ class LLMModel {
   final String downloadUrl;
   final String fileName;
   final int sizeBytes;
+  final String ramLabel;
+  final String performanceLabel;
+  final bool recommended;
 
   const LLMModel({
     required this.name,
@@ -60,6 +63,9 @@ class LLMModel {
     required this.downloadUrl,
     required this.fileName,
     required this.sizeBytes,
+    required this.ramLabel,
+    required this.performanceLabel,
+    this.recommended = false,
   });
 
   String get sizeLabel {
@@ -76,6 +82,9 @@ const List<LLMModel> availableModels = [
         'https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf',
     fileName: 'tinyllama-1.1b-q4_k_m.gguf',
     sizeBytes: 668000000,
+    ramLabel: '3 GB+ RAM',
+    performanceLabel: 'Fast',
+    recommended: true,
   ),
   LLMModel(
     name: 'Phi-2 2.7B',
@@ -84,6 +93,8 @@ const List<LLMModel> availableModels = [
         'https://huggingface.co/TheBloke/phi-2-GGUF/resolve/main/phi-2.Q4_K_M.gguf',
     fileName: 'phi-2-q4_k_m.gguf',
     sizeBytes: 1700000000,
+    ramLabel: '6 GB+ RAM',
+    performanceLabel: 'Balanced',
   ),
   LLMModel(
     name: 'Gemma 2B',
@@ -92,5 +103,7 @@ const List<LLMModel> availableModels = [
         'https://huggingface.co/google/gemma-2b-it-GGUF/resolve/main/2b-it-q4_k_m.gguf',
     fileName: 'gemma-2b-it-q4_k_m.gguf',
     sizeBytes: 1497000000,
+    ramLabel: '6 GB+ RAM',
+    performanceLabel: 'Smart',
   ),
 ];
