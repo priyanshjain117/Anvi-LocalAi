@@ -112,10 +112,63 @@ class _ModelPickerScreenState extends State<ModelPickerScreen> {
     _cancelTokens.remove(model.fileName);
   }
 
+  Future<void> _deleteModel(LLMModel model) async {
+    HapticFeedback.selectionClick();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Delete ${model.name}?'),
+        content: Text(
+          'This removes ${Formatters.bytes(model.sizeBytes)} from this device. You can download it again later.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      await _manager.deleteModel(model);
+      if (!mounted) return;
+      setState(() {
+        _downloaded[model.fileName] = false;
+        _progress.remove(model.fileName);
+        _details.remove(model.fileName);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${model.name} deleted from device')),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Delete failed: $error')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
     final tablet = width >= 760;
+    final groups = [
+      'Starter phones',
+      'Phones (6-8 GB RAM)',
+      'Phones/Tablets (12-16 GB RAM)',
+    ];
+    final groupedModels = {
+      for (final group in groups)
+        group: availableModels
+            .where((model) => model.deviceGroup == group)
+            .toList(growable: false),
+    };
 
     return Scaffold(
       body: AmbientBackground(
@@ -131,44 +184,89 @@ class _ModelPickerScreenState extends State<ModelPickerScreen> {
                 ),
                 sliver: SliverToBoxAdapter(child: _Header(tablet: tablet)),
               ),
-              SliverPadding(
-                padding: EdgeInsets.fromLTRB(
-                  tablet ? 40 : 22,
-                  28,
-                  tablet ? 40 : 22,
-                  120,
-                ),
-                sliver: SliverGrid.builder(
-                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: width >= 1100
-                        ? 3
-                        : width >= 720
-                            ? 2
-                            : 1,
-                    mainAxisSpacing: 16,
-                    crossAxisSpacing: 16,
-                    mainAxisExtent: tablet ? 250 : 236,
+              for (final group in groups) ...[
+                SliverPadding(
+                  padding: EdgeInsets.fromLTRB(
+                    tablet ? 40 : 22,
+                    28,
+                    tablet ? 40 : 22,
+                    0,
                   ),
-                  itemCount: availableModels.length,
-                  itemBuilder: (context, index) {
-                    final model = availableModels[index];
-                    return _ModelCard(
-                      model: model,
-                      isDownloaded: _downloaded[model.fileName] ?? false,
-                      isDownloading: _downloading == model.fileName,
-                      isLoading: _loading == model.fileName,
-                      progress: _progress[model.fileName] ?? 0,
-                      details: _details[model.fileName],
-                      onTap: () => _handleModel(model),
-                      onCancel: () => _cancelDownload(model),
-                    );
-                  },
+                  sliver: SliverToBoxAdapter(
+                    child: _ModelSectionHeader(
+                      title: group,
+                      count: groupedModels[group]?.length ?? 0,
+                    ),
+                  ),
                 ),
-              ),
+                SliverPadding(
+                  padding: EdgeInsets.fromLTRB(
+                    tablet ? 40 : 22,
+                    14,
+                    tablet ? 40 : 22,
+                    group == groups.last ? 120 : 4,
+                  ),
+                  sliver: SliverGrid.builder(
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: width >= 1120
+                          ? 3
+                          : width >= 720
+                              ? 2
+                              : 1,
+                      mainAxisSpacing: 16,
+                      crossAxisSpacing: 16,
+                      mainAxisExtent: width < 390
+                          ? 328
+                          : width >= 720
+                              ? 304
+                              : 312,
+                    ),
+                    itemCount: groupedModels[group]?.length ?? 0,
+                    itemBuilder: (context, index) {
+                      final model = groupedModels[group]![index];
+                      return _ModelCard(
+                        model: model,
+                        isDownloaded: _downloaded[model.fileName] ?? false,
+                        isDownloading: _downloading == model.fileName,
+                        isLoading: _loading == model.fileName,
+                        progress: _progress[model.fileName] ?? 0,
+                        details: _details[model.fileName],
+                        onTap: () => _handleModel(model),
+                        onCancel: () => _cancelDownload(model),
+                        onDelete: () => _deleteModel(model),
+                      );
+                    },
+                  ),
+                ),
+              ],
             ],
           ),
         ),
       ),
+    );
+  }
+}
+
+class _ModelSectionHeader extends StatelessWidget {
+  final String title;
+  final int count;
+
+  const _ModelSectionHeader({required this.title, required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            title,
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+        ),
+        _Badge(label: '$count options'),
+      ],
     );
   }
 }
@@ -309,6 +407,7 @@ class _ModelCard extends StatelessWidget {
   final DownloadProgress? details;
   final VoidCallback onTap;
   final VoidCallback onCancel;
+  final VoidCallback onDelete;
 
   const _ModelCard({
     required this.model,
@@ -319,6 +418,7 @@ class _ModelCard extends StatelessWidget {
     required this.details,
     required this.onTap,
     required this.onCancel,
+    required this.onDelete,
   });
 
   @override
@@ -374,6 +474,16 @@ class _ModelCard extends StatelessWidget {
                   isLoading: isLoading,
                   progress: progress,
                 ),
+                if (isDownloaded && !busy) ...[
+                  const SizedBox(width: 4),
+                  IconButton(
+                    tooltip: 'Delete model',
+                    onPressed: onDelete,
+                    icon: const Icon(Icons.delete_outline_rounded, size: 20),
+                    color: Colors.white54,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
               ],
             ),
             const SizedBox(height: AnviSpacing.lg),

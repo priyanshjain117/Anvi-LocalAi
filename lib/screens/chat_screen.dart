@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
@@ -8,7 +10,10 @@ import '../core/widgets/ambient_background.dart';
 import '../core/widgets/anvi_logo.dart';
 import '../core/widgets/glass_panel.dart';
 import '../core/widgets/pressable_scale.dart';
+import '../models/chat_turn.dart';
+import '../models/file_attachment.dart';
 import '../models/llm_model.dart';
+import '../services/file_attachment_service.dart';
 import '../services/model_manager.dart';
 import 'model_picker_screen.dart';
 
@@ -22,12 +27,17 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _manager = ModelManager();
+  final _fileService = FileAttachmentService();
   final _controller = TextEditingController();
   final _focusNode = FocusNode();
   final _scrollController = ScrollController();
   final List<_Message> _messages = [];
+  final List<FileAttachment> _attachedFiles = [];
+  StreamSubscription<String>? _streamSub;
   bool _thinking = false;
+  bool _pickingFiles = false;
   bool _showJump = false;
+  bool _userNearBottom = true;
 
   @override
   void initState() {
@@ -37,6 +47,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _streamSub?.cancel();
+    _manager.stopGeneration();
     _controller.dispose();
     _focusNode.dispose();
     _scrollController
@@ -49,6 +61,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_scrollController.hasClients) return;
     final distance =
         _scrollController.position.maxScrollExtent - _scrollController.offset;
+    _userNearBottom = distance < 160;
     final shouldShow = distance > 360;
     if (shouldShow != _showJump) setState(() => _showJump = shouldShow);
   }
@@ -59,61 +72,82 @@ class _ChatScreenState extends State<ChatScreen> {
 
     HapticFeedback.lightImpact();
     _controller.clear();
+    final promptAttachments =
+        _attachedFiles.where((file) => file.isReady).toList(growable: false);
+    final history = _messages
+        .where((message) => message.text.trim().isNotEmpty)
+        .map((message) => ChatTurn(
+              role: message.role == _Role.user
+                  ? ChatRole.user
+                  : ChatRole.assistant,
+              text: message.text,
+            ))
+        .toList(growable: false);
     setState(() {
-      _messages.add(
-          _Message(role: _Role.user, text: text, createdAt: DateTime.now()));
-      _messages.add(
-          _Message(role: _Role.assistant, text: '', createdAt: DateTime.now()));
+      _messages.add(_Message(
+        role: _Role.user,
+        text: text,
+        createdAt: DateTime.now(),
+        attachments: promptAttachments,
+      ));
+      _messages.add(_Message(
+        role: _Role.assistant,
+        text: '',
+        createdAt: DateTime.now(),
+      ));
+      _attachedFiles.removeWhere((file) => file.isReady);
       _thinking = true;
     });
-    _scrollToBottom();
+    _scrollToBottom(force: true);
 
     final buffer = StringBuffer();
     var lastPaint = DateTime.now();
-    try {
-      await for (final token in _manager.chat(text)) {
-        buffer.write(token);
-        final now = DateTime.now();
-        if (now.difference(lastPaint).inMilliseconds < 34) continue;
-        lastPaint = now;
-        if (!mounted) return;
-        setState(() {
-          _messages[_messages.length - 1] =
-              _messages.last.copyWith(text: buffer.toString());
-        });
-        _scrollToBottom();
-      }
-      if (mounted) {
-        setState(() {
-          _messages[_messages.length - 1] =
-              _messages.last.copyWith(text: buffer.toString());
-        });
-      }
-    } catch (error) {
-      if (mounted) {
-        setState(() {
-          _messages[_messages.length - 1] = _Message(
-            role: _Role.assistant,
-            text: 'Warning: $error',
-            createdAt: DateTime.now(),
-          );
-        });
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _thinking = false);
-        _scrollToBottom();
-      }
-    }
+    await _streamSub?.cancel();
+    _streamSub = _manager
+        .chat(text, history: history, attachments: promptAttachments)
+        .listen((token) {
+      buffer.write(token);
+      final now = DateTime.now();
+      if (now.difference(lastPaint).inMilliseconds < 45) return;
+      lastPaint = now;
+      if (!mounted) return;
+      setState(() {
+        _messages[_messages.length - 1] =
+            _messages.last.copyWith(text: buffer.toString());
+      });
+      _scrollToBottom();
+    }, onError: (Object error) {
+      if (!mounted) return;
+      setState(() {
+        _messages[_messages.length - 1] = _Message(
+          role: _Role.assistant,
+          text: _friendlyError(error),
+          createdAt: DateTime.now(),
+          failed: true,
+        );
+        _thinking = false;
+      });
+    }, onDone: () {
+      if (!mounted) return;
+      setState(() {
+        _messages[_messages.length - 1] = _messages.last.copyWith(
+          text: buffer.toString().trim(),
+        );
+        _thinking = false;
+      });
+      _scrollToBottom(force: true);
+    });
   }
 
   void _stop() {
     HapticFeedback.selectionClick();
+    _streamSub?.cancel();
     _manager.stopGeneration();
     setState(() => _thinking = false);
   }
 
-  void _scrollToBottom() {
+  void _scrollToBottom({bool force = false}) {
+    if (!force && !_userNearBottom) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
       _scrollController.animateTo(
@@ -122,6 +156,47 @@ class _ChatScreenState extends State<ChatScreen> {
         curve: Curves.easeOutCubic,
       );
     });
+  }
+
+  Future<void> _pickFiles() async {
+    if (_pickingFiles || _thinking) return;
+    HapticFeedback.selectionClick();
+    setState(() => _pickingFiles = true);
+    try {
+      final files = await _fileService.pickAndParse();
+      if (!mounted || files.isEmpty) return;
+      setState(() {
+        _attachedFiles
+          ..removeWhere((file) => !file.isReady)
+          ..addAll(files);
+      });
+      final failed = files.where((file) => !file.isReady).length;
+      if (failed > 0 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$failed file could not be parsed')),
+        );
+      }
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('File picker failed: $error')),
+      );
+    } finally {
+      if (mounted) setState(() => _pickingFiles = false);
+    }
+  }
+
+  void _removeAttachment(FileAttachment file) {
+    setState(() => _attachedFiles.remove(file));
+  }
+
+  String _friendlyError(Object error) {
+    final message = error.toString();
+    if (message.toLowerCase().contains('memory') ||
+        message.toLowerCase().contains('oom')) {
+      return 'I ran out of available memory while generating. Try a shorter prompt or reload a smaller model.';
+    }
+    return 'I hit an inference error. Please try again with a shorter message.';
   }
 
   Future<void> _copyMessage(String text) async {
@@ -170,7 +245,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                     tablet ? 36 : 18,
                                     18,
                                     tablet ? 36 : 18,
-                                    132,
+                                    18,
                                   ),
                                   itemCount: _messages.length,
                                   itemBuilder: (context, index) {
@@ -185,23 +260,22 @@ class _ChatScreenState extends State<ChatScreen> {
                                   },
                                 ),
                         ),
+                        _Composer(
+                          controller: _controller,
+                          focusNode: _focusNode,
+                          thinking: _thinking,
+                          pickingFiles: _pickingFiles,
+                          attachments: _attachedFiles,
+                          onSend: _send,
+                          onStop: _stop,
+                          onAttach: _pickFiles,
+                          onRemoveAttachment: _removeAttachment,
+                        ),
                       ],
                     ),
                     Positioned(
-                      left: tablet ? 36 : 16,
-                      right: tablet ? 36 : 16,
-                      bottom: 16,
-                      child: _Composer(
-                        controller: _controller,
-                        focusNode: _focusNode,
-                        thinking: _thinking,
-                        onSend: _send,
-                        onStop: _stop,
-                      ),
-                    ),
-                    Positioned(
                       right: 24,
-                      bottom: 104,
+                      bottom: 118 + MediaQuery.viewInsetsOf(context).bottom,
                       child: AnimatedScale(
                         scale: _showJump ? 1 : 0,
                         duration: const Duration(milliseconds: 180),
@@ -326,82 +400,190 @@ class _Composer extends StatelessWidget {
   final TextEditingController controller;
   final FocusNode focusNode;
   final bool thinking;
+  final bool pickingFiles;
+  final List<FileAttachment> attachments;
   final VoidCallback onSend;
   final VoidCallback onStop;
+  final VoidCallback onAttach;
+  final ValueChanged<FileAttachment> onRemoveAttachment;
 
   const _Composer({
     required this.controller,
     required this.focusNode,
     required this.thinking,
+    required this.pickingFiles,
+    required this.attachments,
     required this.onSend,
     required this.onStop,
+    required this.onAttach,
+    required this.onRemoveAttachment,
   });
 
   @override
   Widget build(BuildContext context) {
-    return GlassPanel(
-      glow: focusNode.hasFocus,
-      padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-      borderRadius: BorderRadius.circular(28),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          IconButton(
-            tooltip: 'Attach',
-            onPressed: () => HapticFeedback.selectionClick(),
-            icon: const Icon(Icons.add_rounded, color: Colors.white54),
-          ),
-          Expanded(
-            child: TextField(
-              controller: controller,
-              focusNode: focusNode,
-              minLines: 1,
-              maxLines: 5,
-              textInputAction: TextInputAction.newline,
-              style: const TextStyle(fontSize: 15.5, height: 1.35),
-              decoration: const InputDecoration(
-                hintText: 'Ask Anvi anything...',
-                hintStyle: TextStyle(color: Colors.white38),
-                contentPadding:
-                    EdgeInsets.symmetric(horizontal: 4, vertical: 13),
-                filled: false,
-              ),
-              onSubmitted: (_) => onSend(),
-            ),
-          ),
-          IconButton(
-            tooltip: 'Voice',
-            onPressed: () => HapticFeedback.selectionClick(),
-            icon: const Icon(Icons.mic_none_rounded, color: Colors.white54),
-          ),
-          PressableScale(
-            onTap: thinking ? onStop : onSend,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 180),
-              width: 46,
-              height: 46,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: LinearGradient(
-                  colors: thinking
-                      ? [AnviColors.crimson, AnviColors.ember]
-                      : [AnviColors.champagne, AnviColors.ember],
+    final width = MediaQuery.sizeOf(context).width;
+    final tablet = width >= 860;
+    return SafeArea(
+      top: false,
+      minimum: EdgeInsets.fromLTRB(tablet ? 36 : 16, 8, tablet ? 36 : 16, 16),
+      child: AnimatedBuilder(
+        animation: focusNode,
+        builder: (context, _) {
+          return GlassPanel(
+            glow: focusNode.hasFocus,
+            padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+            borderRadius: BorderRadius.circular(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (attachments.isNotEmpty)
+                  _AttachmentTray(
+                    attachments: attachments,
+                    onRemove: onRemoveAttachment,
+                  ),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    IconButton(
+                      tooltip: 'Attach file',
+                      onPressed: thinking || pickingFiles ? null : onAttach,
+                      icon: pickingFiles
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.add_rounded,
+                              color: Colors.white54),
+                    ),
+                    Expanded(
+                      child: TextField(
+                        controller: controller,
+                        focusNode: focusNode,
+                        minLines: 1,
+                        maxLines: 5,
+                        textInputAction: TextInputAction.newline,
+                        style: const TextStyle(fontSize: 15.5, height: 1.35),
+                        decoration: const InputDecoration(
+                          hintText: 'Ask Anvi anything...',
+                          hintStyle: TextStyle(color: Colors.white38),
+                          contentPadding:
+                              EdgeInsets.symmetric(horizontal: 4, vertical: 13),
+                          filled: false,
+                        ),
+                        onSubmitted: (_) => onSend(),
+                      ),
+                    ),
+                    PressableScale(
+                      onTap: thinking ? onStop : onSend,
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 180),
+                        width: 46,
+                        height: 46,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          gradient: LinearGradient(
+                            colors: thinking
+                                ? [AnviColors.crimson, AnviColors.ember]
+                                : [AnviColors.champagne, AnviColors.ember],
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: (thinking
+                                      ? AnviColors.crimson
+                                      : AnviColors.ember)
+                                  .withValues(alpha: 0.42),
+                              blurRadius: 22,
+                            ),
+                          ],
+                        ),
+                        child: Icon(
+                          thinking
+                              ? Icons.stop_rounded
+                              : Icons.arrow_upward_rounded,
+                          color: AnviColors.voidBlack,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-                boxShadow: [
-                  BoxShadow(
-                    color: (thinking ? AnviColors.crimson : AnviColors.ember)
-                        .withValues(alpha: 0.42),
-                    blurRadius: 22,
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _AttachmentTray extends StatelessWidget {
+  final List<FileAttachment> attachments;
+  final ValueChanged<FileAttachment> onRemove;
+
+  const _AttachmentTray({
+    required this.attachments,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, right: 4, bottom: 8),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: attachments.map((file) {
+            final failed = !file.isReady;
+            return Container(
+              constraints: const BoxConstraints(maxWidth: 260),
+              padding: const EdgeInsets.only(left: 10, right: 4),
+              decoration: BoxDecoration(
+                color: failed
+                    ? AnviColors.crimson.withValues(alpha: 0.16)
+                    : Colors.white.withValues(alpha: 0.07),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: failed
+                      ? AnviColors.crimson.withValues(alpha: 0.35)
+                      : Colors.white12,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    failed
+                        ? Icons.error_outline_rounded
+                        : Icons.description_rounded,
+                    size: 15,
+                    color: failed ? AnviColors.crimson : AnviColors.champagne,
+                  ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      file.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style:
+                          const TextStyle(fontSize: 12, color: Colors.white70),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Remove',
+                    constraints:
+                        const BoxConstraints.tightFor(width: 30, height: 30),
+                    padding: EdgeInsets.zero,
+                    onPressed: () => onRemove(file),
+                    icon: const Icon(Icons.close_rounded,
+                        size: 15, color: Colors.white38),
                   ),
                 ],
               ),
-              child: Icon(
-                thinking ? Icons.stop_rounded : Icons.arrow_upward_rounded,
-                color: AnviColors.voidBlack,
-              ),
-            ),
-          ),
-        ],
+            );
+          }).toList(),
+        ),
       ),
     );
   }
@@ -411,15 +593,25 @@ class _Message {
   final _Role role;
   final String text;
   final DateTime createdAt;
+  final List<FileAttachment> attachments;
+  final bool failed;
 
   const _Message({
     required this.role,
     required this.text,
     required this.createdAt,
+    this.attachments = const [],
+    this.failed = false,
   });
 
   _Message copyWith({String? text}) {
-    return _Message(role: role, text: text ?? this.text, createdAt: createdAt);
+    return _Message(
+      role: role,
+      text: text ?? this.text,
+      createdAt: createdAt,
+      attachments: attachments,
+      failed: failed,
+    );
   }
 }
 
@@ -454,15 +646,20 @@ class _ChatBubble extends StatelessWidget {
             child: DecoratedBox(
               decoration: BoxDecoration(
                 gradient: LinearGradient(
-                  colors: isUser
+                  colors: message.failed
                       ? [
-                          AnviColors.ember.withValues(alpha: 0.28),
-                          AnviColors.crimson.withValues(alpha: 0.16),
+                          AnviColors.crimson.withValues(alpha: 0.18),
+                          AnviColors.crimson.withValues(alpha: 0.08),
                         ]
-                      : [
-                          Colors.white.withValues(alpha: 0.075),
-                          Colors.white.withValues(alpha: 0.035),
-                        ],
+                      : isUser
+                          ? [
+                              AnviColors.ember.withValues(alpha: 0.28),
+                              AnviColors.crimson.withValues(alpha: 0.16),
+                            ]
+                          : [
+                              Colors.white.withValues(alpha: 0.075),
+                              Colors.white.withValues(alpha: 0.035),
+                            ],
                 ),
                 borderRadius: BorderRadius.only(
                   topLeft: const Radius.circular(22),
@@ -499,6 +696,16 @@ class _ChatBubble extends StatelessWidget {
                       const _TypingIndicator()
                     else
                       _MarkdownMessage(text: message.text),
+                    if (message.attachments.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: message.attachments
+                            .map((file) => _SentAttachmentChip(file: file))
+                            .toList(),
+                      ),
+                    ],
                     const SizedBox(height: 8),
                     Row(
                       mainAxisSize: MainAxisSize.min,
@@ -540,6 +747,41 @@ class _ChatBubble extends StatelessWidget {
   }
 }
 
+class _SentAttachmentChip extends StatelessWidget {
+  final FileAttachment file;
+
+  const _SentAttachmentChip({required this.file});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 240),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.18),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.description_rounded,
+              size: 14, color: AnviColors.champagne),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              file.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11.5, color: Colors.white70),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _MarkdownMessage extends StatelessWidget {
   final String text;
 
@@ -550,6 +792,8 @@ class _MarkdownMessage extends StatelessWidget {
     return MarkdownBody(
       data: text,
       selectable: true,
+      fitContent: false,
+      softLineBreak: true,
       styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
         p: const TextStyle(fontSize: 14.8, height: 1.5, color: AnviColors.bone),
         code: const TextStyle(

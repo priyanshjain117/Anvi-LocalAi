@@ -4,6 +4,8 @@ import 'package:dio/dio.dart';
 import 'package:fllama/fllama.dart';
 import 'package:path_provider/path_provider.dart';
 import '../core/utils/download_progress.dart';
+import '../models/chat_turn.dart';
+import '../models/file_attachment.dart';
 import '../models/llm_model.dart';
 
 class ModelManager {
@@ -13,6 +15,11 @@ class ModelManager {
 
   String? _contextId;
   LLMModel? _loadedModel;
+  int _generationId = 0;
+
+  static const int _contextLength = 2048;
+  static const int _reservedOutputTokens = 220;
+  static const int _maxPromptTokens = _contextLength - _reservedOutputTokens;
 
   String? get contextId => _contextId;
   LLMModel? get loadedModel => _loadedModel;
@@ -28,6 +35,23 @@ class ModelManager {
   Future<bool> isDownloaded(LLMModel model) async {
     final path = await modelPath(model);
     return File(path).exists();
+  }
+
+  Future<void> deleteModel(LLMModel model) async {
+    if (_loadedModel?.fileName == model.fileName) {
+      stopGeneration();
+      if (_contextId != null) {
+        await Fllama.instance()?.releaseContext(double.parse(_contextId!));
+      }
+      _contextId = null;
+      _loadedModel = null;
+    }
+
+    final path = await modelPath(model);
+    final file = File(path);
+    if (await file.exists()) {
+      await file.delete();
+    }
   }
 
   // ── Download ───────────────────────────────────────────────────────────────
@@ -79,10 +103,15 @@ class ModelManager {
 
     final path = await modelPath(model);
 
-    final result = await Fllama.instance()?.initContext(path,
-        nCtx: 2048, // Context window size
-        nGpuLayers: 33,
-        emitLoadProgress: true);
+    final result = await Fllama.instance()?.initContext(
+      path,
+      nCtx: _contextLength,
+      nBatch: 256,
+      nGpuLayers: 33,
+      useMlock: false,
+      useMmap: true,
+      emitLoadProgress: true,
+    );
 
     if (result == null || result['contextId'] == null) {
       throw Exception('fllama: initContext failed — model may be corrupt.');
@@ -98,22 +127,28 @@ class ModelManager {
   // data["result"]["token"] holding the new token string.
   // End of generation fires function=="completionEnd".
 
-  Stream<String> chat(String userMessage) async* {
+  Stream<String> chat(
+    String userMessage, {
+    required List<ChatTurn> history,
+    List<FileAttachment> attachments = const [],
+  }) async* {
     if (_contextId == null) {
       throw StateError('No model loaded — call loadModel() first.');
     }
 
-    // Note: Added </s> tags to help the model know when turns end
-    final prompt =
-        '<|system|>\nYou are a helpful AI assistant running fully on-device. '
-        'Be concise.\n</s>\n'
-        '<|user|>\n$userMessage\n</s>\n'
-        '<|assistant|>\n';
+    final generationId = ++_generationId;
+    final prompt = await _buildPrompt(
+      userMessage,
+      history: history,
+      attachments: attachments,
+    );
 
     final controller = StreamController<String>();
 
     final sub = Fllama.instance()?.onTokenStream?.listen((data) {
       final fn = data['function'];
+
+      if (generationId != _generationId) return;
 
       if (fn == 'completion') {
         // Safely extract the token depending on how fllama wraps the map
@@ -134,11 +169,23 @@ class ModelManager {
         ?.completion(
       double.parse(_contextId!),
       prompt: prompt,
-      nPredict: 512,
-      temperature: 0.7,
-      topP: 0.9,
-      penaltyRepeat: 1.1,
-      stop: ['<|user|>', '<|system|>', '</s>'],
+      nPredict: _reservedOutputTokens,
+      temperature: 0.28,
+      topK: 30,
+      topP: 0.82,
+      minP: 0.05,
+      penaltyLastN: 256,
+      penaltyRepeat: 1.18,
+      penaltyFreq: 0.08,
+      penaltyPresent: 0.02,
+      stop: [
+        '</assistant>',
+        '<user>',
+        '</user>',
+        '<system>',
+        '</system>',
+        '<conversation_history>',
+      ],
       emitRealtimeCompletion: true, // <--- This wakes up the stream!
     )
         .then((_) {
@@ -155,9 +202,140 @@ class ModelManager {
     await sub?.cancel();
   }
 
+  Future<String> _buildPrompt(
+    String userMessage, {
+    required List<ChatTurn> history,
+    required List<FileAttachment> attachments,
+  }) async {
+    final fileContext = _formatAttachments(attachments);
+    var retained = history
+        .where((turn) => turn.text.trim().isNotEmpty)
+        .toList(growable: true);
+
+    while (retained.isNotEmpty) {
+      final prompt = _formatPrompt(
+        userMessage,
+        history: retained,
+        fileContext: fileContext,
+      );
+      if (await _tokenCount(prompt) <= _maxPromptTokens) return prompt;
+      retained.removeAt(0);
+    }
+
+    final prompt = _formatPrompt(
+      userMessage,
+      history: const [],
+      fileContext: fileContext,
+    );
+    if (await _tokenCount(prompt) <= _maxPromptTokens) return prompt;
+    return _formatPrompt(
+      _clipByCharacters(userMessage, 2600),
+      history: const [],
+      fileContext: _clipByCharacters(fileContext, 7000),
+    );
+  }
+
+  String _formatPrompt(
+    String userMessage, {
+    required List<ChatTurn> history,
+    required String fileContext,
+  }) {
+    final buffer = StringBuffer()
+      ..writeln('<system>')
+      ..writeln(
+          'You are Anvi, a concise and intelligent offline AI assistant running fully on-device.')
+      ..writeln()
+      ..writeln('Rules:')
+      ..writeln('- Answer directly and naturally')
+      ..writeln('- Keep responses concise unless user asks otherwise')
+      ..writeln('- Never generate fake professionalism')
+      ..writeln('- Never generate template/business-email responses')
+      ..writeln('- Avoid repetition')
+      ..writeln('- Admit uncertainty honestly')
+      ..writeln('- Maintain conversational context')
+      ..writeln('- Be accurate in math and reasoning')
+      ..writeln('</system>')
+      ..writeln()
+      ..writeln('<conversation_history>');
+
+    if (history.isEmpty) {
+      buffer.writeln('[No previous turns]');
+    } else {
+      for (final turn in history) {
+        final tag = turn.role == ChatRole.user ? 'user' : 'assistant';
+        buffer
+          ..writeln('<$tag>')
+          ..writeln(_sanitize(turn.text))
+          ..writeln('</$tag>');
+      }
+    }
+    buffer.writeln('</conversation_history>');
+
+    if (fileContext.trim().isNotEmpty) {
+      buffer
+        ..writeln()
+        ..writeln('<selected_files>')
+        ..writeln(fileContext)
+        ..writeln('</selected_files>');
+    }
+
+    buffer
+      ..writeln()
+      ..writeln('<user>')
+      ..writeln(_sanitize(userMessage))
+      ..writeln('</user>')
+      ..writeln()
+      ..write('<assistant>');
+    return buffer.toString();
+  }
+
+  String _formatAttachments(List<FileAttachment> attachments) {
+    final ready = attachments.where((file) => file.isReady).toList();
+    if (ready.isEmpty) return '';
+    final buffer = StringBuffer();
+    for (final file in ready.take(3)) {
+      buffer
+        ..writeln('File: ${file.name}')
+        ..writeln('Type: ${file.extension.toUpperCase()}')
+        ..writeln('Content:')
+        ..writeln(_sanitize(file.text))
+        ..writeln();
+    }
+    return buffer.toString().trim();
+  }
+
+  Future<int> _tokenCount(String text) async {
+    try {
+      final result = await Fllama.instance()
+          ?.tokenize(double.parse(_contextId!), text: text);
+      final tokens = result?['tokens'];
+      if (tokens is List) return tokens.length;
+    } catch (_) {
+      // Fall through to a conservative character estimate if tokenization fails.
+    }
+    return (text.length / 3.6).ceil();
+  }
+
+  String _sanitize(String value) {
+    return value
+        .replaceAll('<system>', '')
+        .replaceAll('</system>', '')
+        .replaceAll('<assistant>', '')
+        .replaceAll('</assistant>', '')
+        .replaceAll('<user>', '')
+        .replaceAll('</user>', '')
+        .trim();
+  }
+
+  String _clipByCharacters(String value, int maxChars) {
+    if (value.length <= maxChars) return value;
+    return '${value.substring(0, maxChars)}\n[Truncated for context.]';
+  }
+
   // ── Stop / cleanup ─────────────────────────────────────────────────────────
 
   void stopGeneration() {
+    _generationId++;
     if (_contextId != null) {
       Fllama.instance()?.stopCompletion(contextId: double.parse(_contextId!));
     }
